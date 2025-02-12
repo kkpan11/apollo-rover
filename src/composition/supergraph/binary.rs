@@ -1,4 +1,6 @@
 use std::fmt::Debug;
+use std::fs;
+use std::process::Stdio;
 
 use apollo_federation_types::{
     config::FederationVersion,
@@ -9,6 +11,8 @@ use camino::Utf8PathBuf;
 use rover_std::warnln;
 use tap::TapFallible;
 
+use super::version::SupergraphVersion;
+use crate::utils::effect::exec::ExecCommandOutput;
 use crate::{
     composition::{CompositionError, CompositionSuccess},
     utils::effect::{
@@ -17,12 +21,14 @@ use crate::{
     },
 };
 
-use super::version::SupergraphVersion;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutputTarget {
+    /// Output to a file, given by the parameter
     File(Utf8PathBuf),
+    /// Output to stdout (inappropriate for LSP usage because stdout is reserved for the LSP itself)
     Stdout,
+    /// Produce an output that only exists in memory, for passing to events
+    InMemory,
 }
 
 impl OutputTarget {
@@ -37,6 +43,7 @@ impl OutputTarget {
                 }
             }
             OutputTarget::Stdout => OutputTarget::Stdout,
+            OutputTarget::InMemory => OutputTarget::InMemory,
         }
     }
 }
@@ -90,13 +97,32 @@ impl SupergraphBinary {
     ) -> Result<CompositionSuccess, CompositionError> {
         let args = self.prepare_compose_args(output_target, &supergraph_config_path);
 
+        if let OutputTarget::File(path) = output_target {
+            let parent = path.parent();
+            if let Some(parent) = parent {
+                if !parent.exists() {
+                    fs::create_dir_all(parent).map_err(|err| CompositionError::UpsertFile {
+                        path: path.clone(),
+                        error: Box::new(err),
+                    })?;
+                }
+            }
+        }
+
+        let config = match output_target {
+            OutputTarget::File(_) | OutputTarget::Stdout => ExecCommandConfig::builder()
+                .exe(self.exe.clone())
+                .args(args)
+                .build(),
+            OutputTarget::InMemory => ExecCommandConfig::builder()
+                .exe(self.exe.clone())
+                .args(args)
+                .output(ExecCommandOutput::builder().stdout(Stdio::piped()).build())
+                .build(),
+        };
+
         let output = exec_impl
-            .exec_command(
-                ExecCommandConfig::builder()
-                    .exe(self.exe.clone())
-                    .args(args)
-                    .build(),
-            )
+            .exec_command(config)
             .await
             .tap_err(|err| tracing::error!("{:?}", err))
             .map_err(|err| CompositionError::Binary {
@@ -122,7 +148,7 @@ impl SupergraphBinary {
                         error: Box::new(err),
                     })?
             }
-            OutputTarget::Stdout => std::str::from_utf8(&output.stdout)
+            OutputTarget::Stdout | OutputTarget::InMemory => std::str::from_utf8(&output.stdout)
                 .map_err(|err| CompositionError::InvalidOutput {
                     binary: self.exe.clone(),
                     error: format!("{:?}", err),
@@ -161,10 +187,11 @@ impl SupergraphBinary {
             .map(|build_output| CompositionSuccess {
                 hints: build_output.hints,
                 supergraph_sdl: build_output.supergraph_sdl,
-                federation_version,
+                federation_version: federation_version.clone(),
             })
             .map_err(|build_errors| CompositionError::Build {
                 source: build_errors,
+                federation_version,
             })
     }
 
@@ -186,6 +213,8 @@ impl SupergraphBinary {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
+        path::PathBuf,
         process::{ExitStatus, Output},
         str::FromStr,
     };
@@ -195,10 +224,12 @@ mod tests {
     use assert_fs::TempDir;
     use camino::Utf8PathBuf;
     use houston::Config;
+    use mockall::predicate;
     use rstest::{fixture, rstest};
     use semver::Version;
     use speculoos::prelude::*;
 
+    use super::{CompositionSuccess, OutputTarget, SupergraphBinary};
     use crate::{
         command::supergraph::compose::do_compose::SupergraphComposeOpts,
         composition::{supergraph::version::SupergraphVersion, test::default_composition_json},
@@ -207,8 +238,6 @@ mod tests {
             effect::{exec::MockExecCommand, read_file::MockReadFile},
         },
     };
-
-    use super::{CompositionSuccess, OutputTarget, SupergraphBinary};
 
     fn fed_one() -> Version {
         Version::from_str("1.0.0").unwrap()
@@ -311,8 +340,18 @@ mod tests {
     }
 
     #[rstest]
+    #[case::output_stdout(OutputTarget::Stdout)]
+    #[case::output_file(OutputTarget::File(Utf8PathBuf::from_str("/tmp/output_dir/output.txt").unwrap()))]
     #[tokio::test]
-    async fn test_compose_success(composition_output: CompositionSuccess) -> Result<()> {
+    async fn test_compose_success(
+        #[case] output_target: OutputTarget,
+        composition_output: CompositionSuccess,
+    ) -> Result<()> {
+        let output_dir = PathBuf::from_str("/tmp/output_dir")?;
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir)?;
+        }
+        assert_that!(output_dir.exists()).is_false();
         let supergraph_version = SupergraphVersion::new(fed_two_eight());
         let binary_path = Utf8PathBuf::from_str("/tmp/supergraph")?;
 
@@ -328,19 +367,33 @@ mod tests {
             Utf8PathBuf::from_str("/tmp/target/supergraph_config.yaml")?;
 
         let mut mock_read_file = MockReadFile::new();
-        mock_read_file.expect_read_file().times(0);
+        if let OutputTarget::File(path) = &output_target {
+            mock_read_file
+                .expect_read_file()
+                .times(1)
+                .with(predicate::eq(path.clone()))
+                .returning(|_| Ok(serde_json::to_string(&default_composition_json()).unwrap()));
+        } else {
+            mock_read_file.expect_read_file().times(0);
+        }
         let mut mock_exec = MockExecCommand::new();
 
         mock_exec
             .expect_exec_command()
             .times(1)
-            .withf(move |actual_config| {
-                actual_config.exe() == &binary_path
-                    && actual_config.args()
-                        == &Some(vec![
-                            "compose".to_string(),
-                            "/tmp/target/supergraph_config.yaml".to_string(),
-                        ])
+            .withf({
+                let output_target = output_target.clone();
+                move |actual_config| {
+                    let mut expected_args = vec![
+                        "compose".to_string(),
+                        "/tmp/target/supergraph_config.yaml".to_string(),
+                    ];
+                    if let OutputTarget::File(path) = &output_target {
+                        expected_args.push(path.to_string());
+                    }
+                    actual_config.exe() == &binary_path
+                        && actual_config.args() == &Some(expected_args)
+                }
             })
             .returning(move |_| {
                 let stdout = serde_json::to_string(&default_composition_json()).unwrap();
@@ -355,10 +408,16 @@ mod tests {
             .compose(
                 &mock_exec,
                 &mock_read_file,
-                &OutputTarget::Stdout,
+                &output_target,
                 temp_supergraph_config_path,
             )
             .await;
+
+        if let OutputTarget::File(path) = output_target {
+            assert_that!(path.parent())
+                .is_some()
+                .matches(|path| path.exists());
+        }
 
         assert_that!(result).is_ok().is_equal_to(composition_output);
 
