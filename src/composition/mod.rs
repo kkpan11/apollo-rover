@@ -1,11 +1,18 @@
 use std::fmt::Debug;
 
-use apollo_federation_types::{
-    config::FederationVersion,
-    rover::{BuildErrors, BuildHint},
-};
+use anyhow::Error;
+use apollo_federation_types::config::{FederationVersion, SchemaSource};
+use apollo_federation_types::rover::{BuildErrors, BuildHint};
 use camino::Utf8PathBuf;
 use derive_getters::Getters;
+
+use crate::composition::supergraph::config::error::ResolveSubgraphError;
+use crate::composition::supergraph::config::resolver::{
+    LoadRemoteSubgraphsError, LoadSupergraphConfigError, ResolveSupergraphConfigError,
+};
+use crate::composition::supergraph::install::InstallSupergraphError;
+use crate::options::LicenseAccepter;
+use crate::utils::client::StudioClientConfig;
 
 pub mod events;
 pub mod pipeline;
@@ -18,11 +25,18 @@ pub mod types;
 #[cfg(feature = "composition-js")]
 mod watchers;
 
+#[derive(Debug, Clone)]
+pub struct FederationUpdaterConfig {
+    pub(crate) studio_client_config: StudioClientConfig,
+    pub(crate) elv2_licence_accepter: LicenseAccepter,
+    pub(crate) skip_update: bool,
+}
+
 #[derive(Getters, Debug, Clone, Eq, PartialEq)]
 pub struct CompositionSuccess {
-    supergraph_sdl: String,
-    hints: Vec<BuildHint>,
-    federation_version: FederationVersion,
+    pub(crate) supergraph_sdl: String,
+    pub(crate) hints: Vec<BuildHint>,
+    pub(crate) federation_version: FederationVersion,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -35,9 +49,9 @@ pub enum CompositionError {
         stdout: String,
         stderr: String,
     },
-    #[error("Failed to parse output of `{binary} compose`")]
+    #[error("Failed to parse output of `{binary} compose`\n{error}")]
     InvalidOutput { binary: Utf8PathBuf, error: String },
-    #[error("Invalid input for `{binary} compose`")]
+    #[error("Invalid input for `{binary} compose`\n{error}")]
     InvalidInput { binary: Utf8PathBuf, error: String },
     #[error("Failed to read the file at: {path}.\n{error}")]
     ReadFile {
@@ -49,8 +63,48 @@ pub enum CompositionError {
         path: Utf8PathBuf,
         error: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[error("Failed to upsert the file at: {path}.\n{error}")]
+    UpsertFile {
+        path: Utf8PathBuf,
+        error: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Encountered {} while trying to build a supergraph.", .source.length_string())]
-    Build { source: BuildErrors },
+    Build {
+        source: BuildErrors,
+        federation_version: FederationVersion,
+    },
     #[error("Serialization error.\n{}", .0)]
     SerdeYaml(#[from] serde_yaml::Error),
+    #[error("{}", .0)]
+    InvalidSupergraphConfig(String),
+    #[error("Error when updating Federation Version:\n{}", .0)]
+    ErrorUpdatingFederationVersion(#[from] InstallSupergraphError),
+    #[error("Error resolving subgraphs:\n{}", .0)]
+    ResolvingSubgraphsError(#[from] ResolveSupergraphConfigError),
+    #[error("Could not install supergraph binary:\n{}", .source)]
+    InstallSupergraphBinaryError { source: InstallSupergraphError },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct CompositionSubgraphAdded {
+    pub(crate) name: String,
+    pub(crate) schema_source: SchemaSource,
+}
+
+#[derive(Debug)]
+pub struct CompositionSubgraphRemoved {
+    pub(crate) name: String,
+    pub(crate) resolution_error: Option<ResolveSubgraphError>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum SupergraphConfigResolutionError {
+    #[error("Could not instantiate Studio Client")]
+    StudioClientInitialisationFailed(#[from] Error),
+    #[error("Could not load remote subgraphs")]
+    LoadRemoteSubgraphsFailed(#[from] LoadRemoteSubgraphsError),
+    #[error("Could not load supergraph config from local file.\n{}", .0)]
+    LoadLocalSupergraphConfigFailed(#[from] LoadSupergraphConfigError),
+    #[error("Could not resolve local and remote elements into complete SupergraphConfig")]
+    ResolveSupergraphConfigFailed(#[from] ResolveSupergraphConfigError),
 }

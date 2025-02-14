@@ -1,10 +1,11 @@
+use std::sync::Arc;
+
 use apollo_federation_types::config::{SchemaSource, SubgraphConfig};
 use camino::Utf8PathBuf;
 use derive_getters::Getters;
 
-use crate::composition::supergraph::config::{
-    error::ResolveSubgraphError, lazy::LazilyResolvedSubgraph,
-};
+use crate::composition::supergraph::config::error::ResolveSubgraphError;
+use crate::composition::supergraph::config::lazy::LazilyResolvedSubgraph;
 
 /// Represents a `SubgraphConfig` that needs to be resolved, either fully or lazily
 #[derive(Clone, Debug, Getters)]
@@ -37,8 +38,9 @@ impl UnresolvedSubgraph {
             Err(err) => Err(ResolveSubgraphError::FileNotFound {
                 subgraph_name: self.name.to_string(),
                 supergraph_config_path: root.clone(),
-                path: path.as_std_path().to_path_buf(),
-                source: err,
+                path: path.clone(),
+                joined_path,
+                source: Arc::new(err),
             }),
         }
     }

@@ -52,8 +52,8 @@ allow = [
     "ISC",
     "MIT",
     "MPL-2.0",
-    "Unicode-DFS-2016",
-    "Unicode-3.0"
+    "Unicode-3.0",
+    "Zlib"
 ]
 confidence-threshold = 0.8
 private = { ignore = true }
@@ -63,6 +63,20 @@ name = "encoding_rs"
 version = "*"
 expression = "(Apache-2.0 OR MIT) AND BSD-3-Clause"
 license-files = [{ path = "COPYRIGHT", hash = 0x39f8ad31 }]
+
+[[licenses.clarify]]
+name = "apollo-language-server"
+version = "*"
+expression = "Elastic-2.0"
+license-files = [{ path = "LICENSE.md", hash = 0x5fc4a573 }]
+
+[[licenses.exceptions]]
+name = "apollo-language-server"
+allow = ["Elastic-2.0"]
+
+[[licenses.exceptions]]
+name = "apollo-federation"
+allow = ["Elastic-2.0"]
 
 # This section is considered when running `cargo deny check bans`.
 # More documentation about the 'bans' section can be found here:

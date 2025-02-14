@@ -1,22 +1,24 @@
 use std::time::Duration;
 
 use apollo_federation_types::config::SchemaSource;
-use futures::{stream::BoxStream, StreamExt};
+use camino::Utf8PathBuf;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use rover_client::operations::subgraph::introspect::SubgraphIntrospectError;
 use rover_std::{infoln, RoverStdError};
 use tap::TapFallible;
-use tokio::{sync::mpsc::UnboundedSender, task::AbortHandle};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use super::{file::SubgraphFileWatcher, introspection::SubgraphIntrospection};
-use crate::{
-    composition::supergraph::config::{
-        error::ResolveSubgraphError,
-        full::{FullyResolveSubgraphService, FullyResolvedSubgraph},
-        lazy::LazilyResolvedSubgraph,
-    },
-    subtask::SubtaskHandleUnit,
+use super::file::SubgraphFileWatcher;
+use super::introspection::SubgraphIntrospection;
+use crate::composition::supergraph::config::error::ResolveSubgraphError;
+use crate::composition::supergraph::config::full::{
+    FullyResolveSubgraphService, FullyResolvedSubgraph,
 };
+use crate::composition::supergraph::config::lazy::LazilyResolvedSubgraph;
+use crate::subtask::SubtaskHandleUnit;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SubgraphFetchError {
@@ -83,10 +85,10 @@ impl SubgraphWatcher {
         // directives from introspection (but not when the source is a file)
         match subgraph.schema() {
             SchemaSource::File { file } => {
-                infoln!("Watching {} for changes", file.as_std_path().display());
+                infoln!("Watching {} for changes", file.display());
                 Self {
                     watcher: SubgraphWatcherKind::File(SubgraphFileWatcher::new(
-                        file.clone(),
+                        Utf8PathBuf::try_from(file.clone()).unwrap(),
                         resolver,
                     )),
                 }
@@ -115,10 +117,13 @@ impl SubgraphWatcherKind {
     ///
     /// Development note: this is a stream of Strings, but in the future we might want something
     /// more flexible to get type safety.
-    async fn watch(self) -> Option<BoxStream<'static, FullyResolvedSubgraph>> {
+    async fn watch(
+        self,
+        cancellation_token: CancellationToken,
+    ) -> Option<BoxStream<'static, FullyResolvedSubgraph>> {
         match self {
-            Self::File(file_watcher) => Some(file_watcher.watch().await),
-            Self::Introspect(introspection) => Some(introspection.watch()),
+            Self::File(file_watcher) => Some(file_watcher.watch(cancellation_token.clone()).await),
+            Self::Introspect(introspection) => Some(introspection.watch(cancellation_token)),
             kind => {
                 tracing::debug!("{kind:?} is not watchable. Skipping");
                 None
@@ -142,18 +147,26 @@ impl SubgraphWatcherKind {
 impl SubtaskHandleUnit for SubgraphWatcher {
     type Output = FullyResolvedSubgraph;
 
-    fn handle(self, sender: UnboundedSender<Self::Output>) -> AbortHandle {
+    fn handle(
+        self,
+        sender: UnboundedSender<Self::Output>,
+        cancellation_token: Option<CancellationToken>,
+    ) {
         let watcher = self.watcher.clone();
+        let cancellation_token = cancellation_token.unwrap_or_default();
         tokio::spawn(async move {
-            let stream = watcher.watch().await;
+            let stream = watcher.watch(cancellation_token.clone()).await;
             if let Some(mut stream) = stream {
-                while let Some(subgraph) = stream.next().await {
-                    let _ = sender
-                        .send(subgraph)
-                        .tap_err(|err| tracing::error!("{:?}", err));
-                }
+                cancellation_token
+                    .run_until_cancelled(async move {
+                        while let Some(subgraph) = stream.next().await {
+                            let _ = sender
+                                .send(subgraph)
+                                .tap_err(|err| tracing::error!("{:?}", err));
+                        }
+                    })
+                    .await;
             }
-        })
-        .abort_handle()
+        });
     }
 }
